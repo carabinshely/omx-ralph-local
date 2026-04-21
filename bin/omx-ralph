@@ -167,6 +167,128 @@ discover_ollama_endpoint() {
   return 1
 }
 
+extract_configured_model_key() {
+  printf '%s\n' "${LOCAL_MODEL#ollama/}"
+}
+
+find_exact_or_latest_model_match() {
+  local expected="$1"
+  local tags="$2"
+
+  if tags_have_model "$tags" "$expected"; then
+    printf '%s\n' "$expected"
+    return 0
+  fi
+
+  if tags_have_model "$tags" "${expected}:latest"; then
+    printf '%s\n' "${expected}:latest"
+    return 0
+  fi
+
+  return 1
+}
+
+rewrite_local_model_value() {
+  local new_model_key="$1"
+  LOCAL_MODEL="ollama/${new_model_key}"
+  export LOCAL_MODEL
+}
+
+read_opencode_model() {
+  local path="$REPO_PATH/opencode.json"
+  [[ -f "$path" ]] || return 1
+  grep -oE '"model"[[:space:]]*:[[:space:]]*"[^"]+"' "$path" \
+    | sed -E 's/.*"model"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+    | head -n 1
+}
+
+read_saved_ralph_loop_state() {
+  local state_file="$STATE_DIR/ralph-loop.state.json"
+  [[ -f "$state_file" ]] || return 1
+  cat "$state_file"
+}
+
+extract_saved_ralph_model() {
+  local state_json="$1"
+  printf '%s' "$state_json" \
+    | grep -oE '"model"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | sed -E 's/.*"model"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+    | head -n 1
+}
+
+extract_saved_ralph_agent() {
+  local state_json="$1"
+  printf '%s' "$state_json" \
+    | grep -oE '"agent"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | sed -E 's/.*"agent"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+    | head -n 1
+}
+
+preflight_exec_environment() {
+  local requested_agent="$1"
+  local requested_model="$2"
+
+  local configured_key resolved_key resolved_url opencode_model
+  configured_key="$(extract_configured_model_key)"
+
+  if ! discover_ollama_endpoint; then
+    die "Ollama API is not reachable. Run 'omx-ralph doctor' and fix endpoint reachability first."
+  fi
+
+  resolved_url="$ACTIVE_OLLAMA_BASE_URL"
+
+  if resolved_key="$(find_exact_or_latest_model_match "$configured_key" "$LAST_OLLAMA_TAGS")"; then
+    if [[ "$resolved_key" != "$configured_key" ]]; then
+      if [[ "$AUTO_FIX_LATEST_MODEL" == "1" ]]; then
+        note "Configured model tag '$configured_key' not found; using '$resolved_key' instead"
+        rewrite_local_model_value "$resolved_key"
+        requested_model="$LOCAL_MODEL"
+      else
+        die "Configured LOCAL_MODEL '$LOCAL_MODEL' was not found, but '${resolved_key}' exists. Set LOCAL_MODEL=ollama/${resolved_key} or enable AUTO_FIX_LATEST_MODEL=1."
+      fi
+    fi
+  else
+    local available_models
+    available_models="$(printf '%s' "$LAST_OLLAMA_TAGS" | extract_model_names_from_tags | join_lines_csv || true)"
+    die "Configured LOCAL_MODEL '$LOCAL_MODEL' not found in Ollama tags. Available tags: ${available_models:-<none>}."
+  fi
+
+  opencode_model="$(read_opencode_model || true)"
+  if [[ -n "${opencode_model:-}" && "$opencode_model" != "$LOCAL_MODEL" ]]; then
+    if [[ "$AUTO_REGENERATE_OPENCODE_CONFIG" == "1" ]]; then
+      note "opencode.json model '$opencode_model' does not match current LOCAL_MODEL '$LOCAL_MODEL'; regenerating"
+      rm -f "$REPO_PATH/opencode.json"
+      write_opencode_config_if_missing
+    else
+      die "opencode.json model '$opencode_model' does not match current LOCAL_MODEL '$LOCAL_MODEL'. Remove opencode.json and run 'omx-ralph bootstrap', or enable AUTO_REGENERATE_OPENCODE_CONFIG=1."
+    fi
+  fi
+
+  local saved_state saved_model saved_agent
+  saved_state="$(read_saved_ralph_loop_state || true)"
+  if [[ -n "${saved_state:-}" ]]; then
+    saved_model="$(extract_saved_ralph_model "$saved_state" || true)"
+    saved_agent="$(extract_saved_ralph_agent "$saved_state" || true)"
+
+    if [[ "$saved_model" != "$requested_model" || "$saved_agent" != "$requested_agent" ]]; then
+      if [[ "$AUTO_CLEAR_STALE_RALPH_STATE" == "1" ]]; then
+        note "Clearing stale Ralph loop state (saved agent/model: ${saved_agent:-?} / ${saved_model:-?})"
+        clear_stale_ralph_runtime_state
+      elif [[ "$FAIL_ON_STALE_RALPH_STATE" == "1" ]]; then
+        die "Stale Ralph loop state detected with saved agent/model '${saved_agent:-?}' / '${saved_model:-?}', which differs from requested '${requested_agent}' / '${requested_model}'. Delete .ralph/ralph-loop.state.json and related runtime files, or enable AUTO_CLEAR_STALE_RALPH_STATE=1."
+      fi
+    fi
+  fi
+}
+
+clear_stale_ralph_runtime_state() {
+  rm -f \
+    "$STATE_DIR/ralph-loop.state.json" \
+    "$STATE_DIR/ralph-history.json" \
+    "$STATE_DIR/ralph-context.md" \
+    "$STATE_DIR/ralph-questions.json"
+}
+
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -191,6 +313,11 @@ load_config() {
   : "${OLLAMA_HEALTH_RETRIES:=4}"
   : "${OLLAMA_HEALTH_RETRY_DELAY:=2}"
   : "${OLLAMA_REQUIRE_MODEL:=1}"
+  
+  : "${AUTO_FIX_LATEST_MODEL:=0}"
+  : "${AUTO_REGENERATE_OPENCODE_CONFIG:=0}"
+  : "${AUTO_CLEAR_STALE_RALPH_STATE:=0}"
+  : "${FAIL_ON_STALE_RALPH_STATE:=1}"
 }
 
 parse_global_args() {
@@ -443,7 +570,20 @@ doctor() {
       if [[ -n "${available_models:-}" ]]; then
         echo "Available model tags:    $available_models"
       fi
-      echo "Recommendation:          pull the expected model or set LOCAL_MODEL=ollama/<exact-tag>"
+      echo "Model availability:      missing ($model_key)"
+      available_models="$(printf '%s' "$LAST_OLLAMA_TAGS" | extract_model_names_from_tags | join_lines_csv || true)"
+      if [[ -n "${available_models:-}" ]]; then
+        echo "Available model tags:    $available_models"
+      fi
+
+      local suggested
+      suggested="$(find_exact_or_latest_model_match "$model_key" "$LAST_OLLAMA_TAGS" || true)"
+      if [[ -n "${suggested:-}" && "$suggested" != "$model_key" ]]; then
+        echo "Recommendation:          use LOCAL_MODEL=ollama/${suggested}"
+        echo "Why:                     exact tag not found, but ':latest' variant exists"
+      else
+        echo "Recommendation:          pull the expected model or set LOCAL_MODEL=ollama/<exact-tag>"
+      fi
 
       if [[ "$OLLAMA_REQUIRE_MODEL" == "1" ]]; then
         return 1
@@ -484,6 +624,27 @@ doctor() {
   fi
 
   return 1
+}
+
+recover_runtime_state() {
+  clear_stale_ralph_runtime_state
+  note "Cleared Ralph runtime state"
+  echo "Removed:"
+  echo "  - $STATE_DIR/ralph-loop.state.json"
+  echo "  - $STATE_DIR/ralph-history.json"
+  echo "  - $STATE_DIR/ralph-context.md"
+  echo "  - $STATE_DIR/ralph-questions.json"
+
+  if [[ -f "$REPO_PATH/opencode.json" ]]; then
+    rm -f "$REPO_PATH/opencode.json"
+    write_opencode_config_if_missing
+    note "Regenerated opencode.json"
+  fi
+
+  echo
+  echo "Next:"
+  echo "  1) omx-ralph doctor"
+  echo "  2) omx-ralph exec"
 }
 
 bootstrap() {
@@ -727,6 +888,9 @@ run_ralph() {
   branch="$(current_branch)"
   prompt_file="$(build_prompt "$role" "$run_dir" "$task" "$branch")"
 
+  preflight_exec_environment "$agent" "$model"
+  model="$LOCAL_MODEL"
+
   note "Running role=$role agent=$agent model=$model"
 
   repo_git switch "$branch" >/dev/null
@@ -802,6 +966,7 @@ Commands:
   status
   hint "text"
   clear-hint
+  recover
 
 Environment or config:
   LOCAL_MODEL=ollama/qwen3-coder:30b
@@ -873,6 +1038,9 @@ main() {
     clear-hint)
       clear_hint
       ;;
+	recover)
+ 	 recover_runtime_state
+ 	 ;;
     *)
       usage
       exit 1
