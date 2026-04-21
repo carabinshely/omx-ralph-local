@@ -56,6 +56,104 @@ normalize_ollama_base_url() {
   printf '%s\n' "$url"
 }
 
+is_wsl() {
+  grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null || \
+  uname -r | grep -qiE '(microsoft|wsl)'
+}
+
+wsl_windows_host_ip() {
+  if command -v ip >/dev/null 2>&1; then
+    ip route show default 2>/dev/null | awk '/default/ {print $3; exit}'
+    return 0
+  fi
+
+  awk '/^nameserver[[:space:]]+/ {print $2; exit}' /etc/resolv.conf 2>/dev/null
+}
+
+build_ollama_candidate_urls() {
+  local configured
+  configured="$(normalize_ollama_base_url)"
+
+  {
+    printf '%s\n' "$configured"
+    printf '%s\n' "http://localhost:11434"
+    printf '%s\n' "http://127.0.0.1:11434"
+
+    if is_wsl; then
+      local win_ip
+      win_ip="$(wsl_windows_host_ip || true)"
+      if [[ -n "${win_ip:-}" ]]; then
+        printf '%s\n' "http://${win_ip}:11434"
+      fi
+    fi
+  } | awk '!seen[$0]++'
+}
+
+fetch_ollama_tags_from_url() {
+  local base_url="$1"
+  curl -fsS --max-time 5 "${base_url%/}/api/tags"
+}
+
+try_ollama_endpoint() {
+  local base_url="$1"
+  local attempt output
+
+  for ((attempt=1; attempt<=OLLAMA_HEALTH_RETRIES; attempt++)); do
+    if output="$(fetch_ollama_tags_from_url "$base_url" 2>/dev/null)"; then
+      printf '%s' "$output"
+      return 0
+    fi
+
+    if (( attempt < OLLAMA_HEALTH_RETRIES )); then
+      sleep "$OLLAMA_HEALTH_RETRY_DELAY"
+    fi
+  done
+
+  return 1
+}
+
+extract_model_names_from_tags() {
+  grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | sed -E 's/"name"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/' \
+    | sort -u
+}
+
+join_lines_csv() {
+  awk '
+    NR == 1 { printf "%s", $0; next }
+    { printf ", %s", $0 }
+    END { if (NR) print "" }
+  '
+}
+
+tags_have_model() {
+  local tags="$1"
+  local expected_model="$2"
+
+  printf '%s' "$tags" | extract_model_names_from_tags | grep -Fxq "$expected_model"
+}
+
+discover_ollama_endpoint() {
+  ACTIVE_OLLAMA_BASE_URL=""
+  LAST_OLLAMA_TAGS=""
+
+  local candidates=()
+  local url tags
+
+  mapfile -t candidates < <(build_ollama_candidate_urls)
+
+  for url in "${candidates[@]}"; do
+    log "probing Ollama endpoint: $url"
+    if tags="$(try_ollama_endpoint "$url")"; then
+      ACTIVE_OLLAMA_BASE_URL="$url"
+      LAST_OLLAMA_TAGS="$tags"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -76,6 +174,10 @@ load_config() {
   : "${MAX_ITERS_DEBUG:=6}"
   : "${MAX_ITERS_VERIFY:=3}"
   : "${MAX_ITERS_MERGE_GATE:=2}"
+
+  : "${OLLAMA_HEALTH_RETRIES:=4}"
+  : "${OLLAMA_HEALTH_RETRY_DELAY:=2}"
+  : "${OLLAMA_REQUIRE_MODEL:=1}"
 }
 
 parse_global_args() {
@@ -187,14 +289,26 @@ ensure_info_exclude_line() {
 
 write_opencode_config_if_missing() {
   local dst="$REPO_PATH/opencode.json"
-  local base_url model_key
+  local base_url model_key configured_url
 
   if [[ -f "$dst" ]]; then
     log "keeping existing $dst"
     return 0
   fi
 
-  base_url="$(normalize_ollama_base_url)"
+  configured_url="$(normalize_ollama_base_url)"
+
+  if discover_ollama_endpoint; then
+    base_url="$ACTIVE_OLLAMA_BASE_URL"
+  else
+    base_url="$configured_url"
+  fi
+
+  if [[ "$base_url" != "$configured_url" ]]; then
+    note "Using discovered reachable Ollama URL for opencode.json: $base_url"
+    note "Configured OLLAMA_BASE_URL was: $configured_url"
+  fi
+
   model_key="${LOCAL_MODEL#ollama/}"
 
   cat > "$dst" <<EOF
@@ -255,42 +369,108 @@ doctor() {
   require_cmd "$RALPH_BIN"
   require_cmd "$OPENCODE_BIN"
 
-  echo "Repository:        $REPO_PATH"
-  echo "State dir:         $STATE_DIR"
-  echo "Ralph:             $(command -v "$RALPH_BIN")"
-  echo "OpenCode:          $(command -v "$OPENCODE_BIN")"
-  echo "Ollama base URL:   $(normalize_ollama_base_url)"
-  echo "Local model:       $LOCAL_MODEL"
-  echo "Merge gate agent:  $MERGE_GATE_AGENT"
-  echo "Merge gate model:  $MERGE_GATE_MODEL"
-  echo "Base branch:       $BASE_BRANCH"
+  local configured_url resolved_url model_key available_models
+  local candidates=()
 
-  if command -v omx >/dev/null 2>&1; then
-    echo "OMX:               $(command -v "$OMX_BIN")"
-  else
-    echo "OMX:               not found on PATH"
-  fi
+  configured_url="$(normalize_ollama_base_url)"
+  model_key="${LOCAL_MODEL#ollama/}"
+  mapfile -t candidates < <(build_ollama_candidate_urls)
 
-  local tags
-  if tags="$(fetch_ollama_tags)"; then
-    echo "Ollama API:        reachable"
+  echo "Repository:              $REPO_PATH"
+  echo "State dir:               $STATE_DIR"
+  echo "Ralph:                   $(command -v "$RALPH_BIN")"
+  echo "OpenCode:                $(command -v "$OPENCODE_BIN")"
+  echo "Configured Ollama URL:   $configured_url"
+  echo "Local model:             $LOCAL_MODEL"
+  echo "Merge gate agent:        $MERGE_GATE_AGENT"
+  echo "Merge gate model:        $MERGE_GATE_MODEL"
+  echo "Base branch:             $BASE_BRANCH"
 
-    if printf '%s' "$tags" | grep -Fq "\"name\":\"${LOCAL_MODEL#ollama/}\""; then
-      echo "Ollama model:      found"
+  if is_wsl; then
+    echo "Runtime context:         WSL detected"
+    local win_ip
+    win_ip="$(wsl_windows_host_ip || true)"
+    if [[ -n "${win_ip:-}" ]]; then
+      echo "Windows host heuristic:  $win_ip"
     else
-      echo "Ollama model:      not confirmed in /api/tags"
-      echo "                    check the exact model tag with:"
-      echo "                    curl $(normalize_ollama_base_url)/api/tags"
+      echo "Windows host heuristic:  unavailable"
     fi
   else
-    echo "Ollama API:        NOT reachable"
-    echo
-    echo "Try:"
-    echo "  curl $(normalize_ollama_base_url)/api/tags"
-    echo
-    echo "If you run WSL with Ollama on Windows, expose the Windows Ollama API to WSL."
-    return 1
+    echo "Runtime context:         non-WSL"
   fi
+
+  if command -v "$OMX_BIN" >/dev/null 2>&1; then
+    echo "OMX:                     $(command -v "$OMX_BIN")"
+  else
+    echo "OMX:                     not found on PATH"
+  fi
+
+  echo "Ollama probe order:"
+  for url in "${candidates[@]}"; do
+    echo "  - $url"
+  done
+
+  if discover_ollama_endpoint; then
+    resolved_url="$ACTIVE_OLLAMA_BASE_URL"
+    echo "Ollama API:              reachable"
+    echo "Resolved Ollama URL:     $resolved_url"
+
+    if [[ "$resolved_url" != "$configured_url" ]]; then
+      echo "Configured URL status:   fallback was needed"
+      echo "Recommendation:          set OLLAMA_BASE_URL=$resolved_url"
+    else
+      echo "Configured URL status:   good"
+    fi
+
+    if tags_have_model "$LAST_OLLAMA_TAGS" "$model_key"; then
+      echo "Model availability:      found ($model_key)"
+    else
+      echo "Model availability:      missing ($model_key)"
+      available_models="$(printf '%s' "$LAST_OLLAMA_TAGS" | extract_model_names_from_tags | join_lines_csv || true)"
+      if [[ -n "${available_models:-}" ]]; then
+        echo "Available model tags:    $available_models"
+      fi
+      echo "Recommendation:          pull the expected model or set LOCAL_MODEL=ollama/<exact-tag>"
+
+      if [[ "$OLLAMA_REQUIRE_MODEL" == "1" ]]; then
+        return 1
+      fi
+    fi
+
+    if [[ -f "$REPO_PATH/opencode.json" ]]; then
+      echo "opencode.json:           present"
+      if ! grep -Fq "\"baseURL\": \"${resolved_url}/v1\"" "$REPO_PATH/opencode.json"; then
+        echo "opencode.json URL:       may not match resolved URL"
+        echo "Recommendation:          update or regenerate opencode.json"
+      fi
+    else
+      echo "opencode.json:           not present yet"
+    fi
+
+    return 0
+  fi
+
+  echo "Ollama API:              NOT reachable"
+  echo "Attempts per candidate:  $OLLAMA_HEALTH_RETRIES"
+  echo "Retry delay (seconds):   $OLLAMA_HEALTH_RETRY_DELAY"
+  echo
+  echo "What to check next:"
+  echo "  1) Test from this shell:"
+  echo "     curl ${configured_url}/api/tags"
+  echo "  2) If you are on WSL and Ollama runs on Windows, verify Windows Ollama is reachable from WSL."
+  echo "  3) If needed, set OLLAMA_BASE_URL explicitly to the Windows-reachable address."
+
+  if is_wsl; then
+    local hint_ip
+    hint_ip="$(wsl_windows_host_ip || true)"
+    if [[ -n "${hint_ip:-}" ]]; then
+      echo
+      echo "WSL hint:"
+      echo "  export OLLAMA_BASE_URL=http://${hint_ip}:11434"
+    fi
+  fi
+
+  return 1
 }
 
 bootstrap() {
