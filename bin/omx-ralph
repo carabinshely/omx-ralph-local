@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+ROLE_TEMPLATE_DIR="$INSTALL_ROOT/templates/roles"
+
+REPO_PATH=""
+STATE_DIR=""
+VERBOSE="${VERBOSE:-0}"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omx-ralph/config"
+
+log() {
+  if [[ "${VERBOSE}" == "1" ]]; then
+    echo "[omx-ralph] $*" >&2
+  fi
+}
+
+note() {
+  echo "==> $*"
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+slugify() {
+  local s="$1"
+  s="$(printf '%s' "$s" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')"
+  [[ -n "$s" ]] || s="task"
+  printf '%s\n' "$s"
+}
+
+latest_match() {
+  local pattern="$1"
+  local files=()
+  shopt -s nullglob
+  files=($pattern)
+  shopt -u nullglob
+  ((${#files[@]} > 0)) || return 1
+  ls -1t -- "${files[@]}" 2>/dev/null | head -n 1
+}
+
+normalize_ollama_base_url() {
+  local url="${OLLAMA_BASE_URL:-http://localhost:11434}"
+  url="${url%/}"
+  url="${url%/v1}"
+  printf '%s\n' "$url"
+}
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+
+  : "${LOCAL_MODEL:=ollama/qwen3-coder:30b}"
+  : "${OLLAMA_BASE_URL:=http://localhost:11434}"
+  : "${CODEX_MODEL:=gpt-5.4}"
+  : "${MERGE_GATE_AGENT:=codex}"
+  : "${MERGE_GATE_MODEL:=$CODEX_MODEL}"
+  : "${BASE_BRANCH:=main}"
+  : "${RALPH_BIN:=ralph}"
+  : "${OPENCODE_BIN:=opencode}"
+  : "${OMX_BIN:=omx}"
+  : "${ALLOW_DIRTY:=0}"
+  : "${MAX_ITERS_EXEC:=12}"
+  : "${MAX_ITERS_DEBUG:=6}"
+  : "${MAX_ITERS_VERIFY:=3}"
+  : "${MAX_ITERS_MERGE_GATE:=2}"
+}
+
+parse_global_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        [[ $# -ge 2 ]] || die "--repo requires a path"
+        REPO_PATH="$2"
+        shift 2
+        ;;
+      --state-dir)
+        [[ $# -ge 2 ]] || die "--state-dir requires a path"
+        STATE_DIR="$2"
+        shift 2
+        ;;
+      --config)
+        [[ $# -ge 2 ]] || die "--config requires a path"
+        CONFIG_FILE="$2"
+        shift 2
+        ;;
+      --verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  CMD="${1:-}"
+  shift || true
+  CMD_ARGS=("$@")
+}
+
+resolve_repo() {
+  if [[ -n "${REPO_PATH:-}" ]]; then
+    [[ -d "$REPO_PATH" ]] || die "repo path does not exist: $REPO_PATH"
+    REPO_PATH="$(cd "$REPO_PATH" && pwd)"
+  else
+    git rev-parse --show-toplevel >/dev/null 2>&1 || die "not inside a git repository. Use --repo /path/to/repo"
+    REPO_PATH="$(git rev-parse --show-toplevel)"
+  fi
+
+  git -C "$REPO_PATH" rev-parse --show-toplevel >/dev/null 2>&1 || die "target path is not a git repository: $REPO_PATH"
+
+  if [[ -z "${STATE_DIR:-}" ]]; then
+    STATE_DIR="$REPO_PATH/.ralph"
+  else
+    mkdir -p "$STATE_DIR"
+    STATE_DIR="$(cd "$STATE_DIR" && pwd)"
+  fi
+
+  PROMPT_DIR="$STATE_DIR/prompts"
+  ROLE_DIR="$STATE_DIR/roles"
+  RUNS_DIR="$STATE_DIR/runs"
+}
+
+repo_git() {
+  git -C "$REPO_PATH" "$@"
+}
+
+ensure_clean_tree() {
+  [[ "$ALLOW_DIRTY" == "1" ]] && return 0
+  [[ -z "$(repo_git status --porcelain)" ]] || die "working tree is dirty. Commit or stash first. Override with ALLOW_DIRTY=1 if you insist."
+}
+
+ensure_state_dirs() {
+  mkdir -p "$STATE_DIR" "$PROMPT_DIR" "$ROLE_DIR" "$RUNS_DIR"
+}
+
+copy_template_if_missing() {
+  local src="$1"
+  local dst="$2"
+
+  if [[ -f "$dst" ]]; then
+    log "keeping existing $dst"
+    return 0
+  fi
+
+  cp -f -- "$src" "$dst"
+}
+
+ensure_role_templates_copied() {
+  ensure_state_dirs
+
+  [[ -d "$ROLE_TEMPLATE_DIR" ]] || die "missing role template directory: $ROLE_TEMPLATE_DIR"
+
+  copy_template_if_missing "$ROLE_TEMPLATE_DIR/executor.md" "$ROLE_DIR/executor.md"
+  copy_template_if_missing "$ROLE_TEMPLATE_DIR/debugger.md" "$ROLE_DIR/debugger.md"
+  copy_template_if_missing "$ROLE_TEMPLATE_DIR/verifier.md" "$ROLE_DIR/verifier.md"
+  copy_template_if_missing "$ROLE_TEMPLATE_DIR/merge-gate.md" "$ROLE_DIR/merge-gate.md"
+}
+
+ensure_info_exclude_line() {
+  local line="$1"
+  local exclude_file="$REPO_PATH/.git/info/exclude"
+  mkdir -p "$(dirname "$exclude_file")"
+  touch "$exclude_file"
+
+  if ! grep -Fqx "$line" "$exclude_file"; then
+    printf '%s\n' "$line" >> "$exclude_file"
+  fi
+}
+
+write_opencode_config_if_missing() {
+  local dst="$REPO_PATH/opencode.json"
+  local base_url model_key
+
+  if [[ -f "$dst" ]]; then
+    log "keeping existing $dst"
+    return 0
+  fi
+
+  base_url="$(normalize_ollama_base_url)"
+  model_key="${LOCAL_MODEL#ollama/}"
+
+  cat > "$dst" <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "default_agent": "build",
+  "model": "${LOCAL_MODEL}",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "${base_url}/v1"
+      },
+      "models": {
+        "${model_key}": {
+          "name": "Local coding model"
+        }
+      }
+    }
+  },
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "bash": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "todowrite": "allow",
+    "question": "allow"
+  },
+  "watcher": {
+    "ignore": [
+      ".git/**",
+      "node_modules/**",
+      "dist/**",
+      "build/**",
+      ".venv/**",
+      "venv/**",
+      ".next/**",
+      ".turbo/**"
+    ]
+  },
+  "autoupdate": false,
+  "share": "disabled"
+}
+EOF
+}
+
+fetch_ollama_tags() {
+  local url
+  url="$(normalize_ollama_base_url)/api/tags"
+  curl -fsS --max-time 5 "$url"
+}
+
+doctor() {
+  require_cmd git
+  require_cmd curl
+  require_cmd "$RALPH_BIN"
+  require_cmd "$OPENCODE_BIN"
+
+  echo "Repository:        $REPO_PATH"
+  echo "State dir:         $STATE_DIR"
+  echo "Ralph:             $(command -v "$RALPH_BIN")"
+  echo "OpenCode:          $(command -v "$OPENCODE_BIN")"
+  echo "Ollama base URL:   $(normalize_ollama_base_url)"
+  echo "Local model:       $LOCAL_MODEL"
+  echo "Merge gate agent:  $MERGE_GATE_AGENT"
+  echo "Merge gate model:  $MERGE_GATE_MODEL"
+  echo "Base branch:       $BASE_BRANCH"
+
+  if command -v omx >/dev/null 2>&1; then
+    echo "OMX:               $(command -v "$OMX_BIN")"
+  else
+    echo "OMX:               not found on PATH"
+  fi
+
+  local tags
+  if tags="$(fetch_ollama_tags)"; then
+    echo "Ollama API:        reachable"
+
+    if printf '%s' "$tags" | grep -Fq "\"name\":\"${LOCAL_MODEL#ollama/}\""; then
+      echo "Ollama model:      found"
+    else
+      echo "Ollama model:      not confirmed in /api/tags"
+      echo "                    check the exact model tag with:"
+      echo "                    curl $(normalize_ollama_base_url)/api/tags"
+    fi
+  else
+    echo "Ollama API:        NOT reachable"
+    echo
+    echo "Try:"
+    echo "  curl $(normalize_ollama_base_url)/api/tags"
+    echo
+    echo "If you run WSL with Ollama on Windows, expose the Windows Ollama API to WSL."
+    return 1
+  fi
+}
+
+bootstrap() {
+  ensure_state_dirs
+  ensure_role_templates_copied
+  write_opencode_config_if_missing
+
+  ensure_info_exclude_line "opencode.json"
+  ensure_info_exclude_line ".ralph/"
+
+  note "Bootstrapped target repo"
+  echo "repo:      $REPO_PATH"
+  echo "state dir: $STATE_DIR"
+  echo
+  echo "Created or ensured:"
+  echo "  - $ROLE_DIR/executor.md"
+  echo "  - $ROLE_DIR/debugger.md"
+  echo "  - $ROLE_DIR/verifier.md"
+  echo "  - $ROLE_DIR/merge-gate.md"
+  echo "  - $REPO_PATH/opencode.json"
+  echo
+  echo "Next:"
+  echo "  omx-ralph plan \"<task>\""
+}
+
+plan_help() {
+  local task="${1:-your task here}"
+
+  cat <<EOF
+Run this in an OMX session:
+
+  ${OMX_BIN} --high
+
+Then inside OMX / Codex:
+
+  \$deep-interview --quick "${task}"
+  \$ralplan --interactive "${task}"
+
+Do not start implementation until both exist:
+
+  .omx/plans/prd-*.md
+  .omx/plans/test-spec-*.md
+
+Then continue with:
+
+  omx-ralph prepare "${task}"
+  omx-ralph exec
+EOF
+}
+
+find_plan_artifacts() {
+  PRD_FILE="$(latest_match "$REPO_PATH/.omx/plans/prd-*.md" || true)"
+  TEST_SPEC_FILE="$(latest_match "$REPO_PATH/.omx/plans/test-spec-*.md" || true)"
+  INTERVIEW_SPEC_FILE="$(latest_match "$REPO_PATH/.omx/specs/deep-interview-*.md" || true)"
+  INTERVIEW_LOG_FILE="$(latest_match "$REPO_PATH/.omx/interviews/*.md" || true)"
+
+  [[ -n "${PRD_FILE:-}" ]] || die "missing .omx/plans/prd-*.md. Run OMX planning first."
+  [[ -n "${TEST_SPEC_FILE:-}" ]] || die "missing .omx/plans/test-spec-*.md. Run OMX planning first."
+}
+
+ensure_base_branch_checked_out() {
+  if repo_git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
+    repo_git switch "$BASE_BRANCH" >/dev/null
+    return 0
+  fi
+
+  if repo_git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
+    repo_git switch -c "$BASE_BRANCH" --track "origin/$BASE_BRANCH" >/dev/null
+    return 0
+  fi
+
+  die "base branch not found locally or on origin: $BASE_BRANCH"
+}
+
+ensure_feature_branch() {
+  local slug="$1"
+  local branch="ralph/${slug}"
+
+  ensure_base_branch_checked_out
+
+  if repo_git show-ref --verify --quiet "refs/heads/$branch"; then
+    repo_git switch "$branch" >/dev/null
+  else
+    repo_git switch -c "$branch" >/dev/null
+  fi
+
+  printf '%s\n' "$branch"
+}
+
+write_run_manifest() {
+  local run_dir="$1"
+  local task="$2"
+  local branch="$3"
+
+  {
+    echo "task: $task"
+    echo "created_at: $(date -Iseconds)"
+    echo "repo_root: $REPO_PATH"
+    echo "feature_branch: $branch"
+    echo "base_branch: $BASE_BRANCH"
+    echo "head_commit: $(repo_git rev-parse HEAD)"
+    echo
+    echo "approved_artifacts:"
+    echo "  prd: approved/$(basename "$PRD_FILE")"
+    echo "  test_spec: approved/$(basename "$TEST_SPEC_FILE")"
+    if [[ -n "${INTERVIEW_SPEC_FILE:-}" ]]; then
+      echo "  interview_spec: approved/$(basename "$INTERVIEW_SPEC_FILE")"
+    else
+      echo "  interview_spec: n/a"
+    fi
+    if [[ -n "${INTERVIEW_LOG_FILE:-}" ]]; then
+      echo "  interview_log: approved/$(basename "$INTERVIEW_LOG_FILE")"
+    else
+      echo "  interview_log: n/a"
+    fi
+  } > "$run_dir/manifest.txt"
+}
+
+prepare_run() {
+  local task="$1"
+
+  ensure_clean_tree
+  ensure_state_dirs
+  ensure_role_templates_copied
+  find_plan_artifacts
+
+  local slug
+  slug="$(slugify "$task")"
+
+  local branch
+  branch="$(ensure_feature_branch "$slug")"
+
+  local run_id
+  run_id="$(date +%Y%m%d-%H%M%S)-${slug}"
+
+  local run_dir="$RUNS_DIR/$run_id"
+  mkdir -p "$run_dir/approved" "$run_dir/logs"
+
+  cp -f -- "$PRD_FILE" "$run_dir/approved/"
+  cp -f -- "$TEST_SPEC_FILE" "$run_dir/approved/"
+
+  if [[ -n "${INTERVIEW_SPEC_FILE:-}" ]]; then
+    cp -f -- "$INTERVIEW_SPEC_FILE" "$run_dir/approved/"
+  fi
+  if [[ -n "${INTERVIEW_LOG_FILE:-}" ]]; then
+    cp -f -- "$INTERVIEW_LOG_FILE" "$run_dir/approved/"
+  fi
+
+  write_run_manifest "$run_dir" "$task" "$branch"
+
+  printf '%s\n' "$run_dir" > "$STATE_DIR/current-run"
+  printf '%s\n' "$branch" > "$STATE_DIR/current-branch"
+  printf '%s\n' "$task" > "$STATE_DIR/current-task"
+
+  note "Prepared run"
+  echo "run_dir: $run_dir"
+  echo "branch:  $branch"
+  echo "task:    $task"
+}
+
+current_run_dir() {
+  [[ -f "$STATE_DIR/current-run" ]] || die "no active run. Use: omx-ralph prepare \"<task>\""
+  local run_dir
+  run_dir="$(cat "$STATE_DIR/current-run")"
+  [[ -d "$run_dir" ]] || die "current run directory does not exist: $run_dir"
+  printf '%s\n' "$run_dir"
+}
+
+current_branch() {
+  [[ -f "$STATE_DIR/current-branch" ]] || die "missing $STATE_DIR/current-branch"
+  cat "$STATE_DIR/current-branch"
+}
+
+current_task() {
+  [[ -f "$STATE_DIR/current-task" ]] || die "missing $STATE_DIR/current-task"
+  cat "$STATE_DIR/current-task"
+}
+
+artifact_snapshot() {
+  local run_dir="$1"
+
+  SNAPSHOT_PRD="$(latest_match "$run_dir/approved/prd-*.md" || true)"
+  SNAPSHOT_TEST_SPEC="$(latest_match "$run_dir/approved/test-spec-*.md" || true)"
+  SNAPSHOT_INTERVIEW_SPEC="$(latest_match "$run_dir/approved/deep-interview-*.md" || true)"
+
+  [[ -n "${SNAPSHOT_PRD:-}" ]] || die "run is missing PRD snapshot"
+  [[ -n "${SNAPSHOT_TEST_SPEC:-}" ]] || die "run is missing test-spec snapshot"
+}
+
+build_prompt() {
+  local role="$1"
+  local run_dir="$2"
+  local task="$3"
+  local branch="$4"
+  local prompt_file="$PROMPT_DIR/current-${role}.md"
+
+  artifact_snapshot "$run_dir"
+
+  {
+    cat "$ROLE_DIR/${role}.md"
+    echo
+    echo "Current task:"
+    echo "$task"
+    echo
+    echo "Current branch:"
+    echo "$branch"
+    echo
+    echo "Base branch:"
+    echo "$BASE_BRANCH"
+    echo
+    echo "Run manifest:"
+    echo "- $run_dir/manifest.txt"
+    echo
+    echo "Approved artifact snapshot. Read these first:"
+    echo "- $SNAPSHOT_PRD"
+    echo "- $SNAPSHOT_TEST_SPEC"
+    if [[ -n "${SNAPSHOT_INTERVIEW_SPEC:-}" ]]; then
+      echo "- $SNAPSHOT_INTERVIEW_SPEC"
+    fi
+    echo
+    echo "Hard guardrails:"
+    echo "- Plan artifacts are immutable for this run."
+    echo "- Stay inside approved scope."
+    echo "- Use concrete evidence."
+    echo "- If blocked, print BLOCKED."
+    echo "- If complete, print COMPLETE."
+  } > "$prompt_file"
+
+  printf '%s\n' "$prompt_file"
+}
+
+run_ralph() {
+  local agent="$1"
+  local model="$2"
+  local role="$3"
+  local max_iters="$4"
+
+  local run_dir task branch prompt_file
+  run_dir="$(current_run_dir)"
+  task="$(current_task)"
+  branch="$(current_branch)"
+  prompt_file="$(build_prompt "$role" "$run_dir" "$task" "$branch")"
+
+  note "Running role=$role agent=$agent model=$model"
+
+  repo_git switch "$branch" >/dev/null
+
+  (
+    cd "$REPO_PATH"
+    "$RALPH_BIN" \
+      --agent "$agent" \
+      --model "$model" \
+      --prompt-file "$prompt_file" \
+      --tasks \
+      --max-iterations "$max_iters" \
+      --abort-promise BLOCKED
+  )
+}
+
+show_current() {
+  local run_dir
+  run_dir="$(current_run_dir)"
+
+  echo "repo:    $REPO_PATH"
+  echo "state:   $STATE_DIR"
+  echo "run_dir: $run_dir"
+  echo "branch:  $(current_branch)"
+  echo "task:    $(current_task)"
+  echo
+  cat "$run_dir/manifest.txt"
+}
+
+status_loop() {
+  (
+    cd "$REPO_PATH"
+    "$RALPH_BIN" --status --tasks
+  )
+}
+
+add_hint() {
+  local text="$1"
+  (
+    cd "$REPO_PATH"
+    "$RALPH_BIN" --add-context "$text"
+  )
+}
+
+clear_hint() {
+  (
+    cd "$REPO_PATH"
+    "$RALPH_BIN" --clear-context
+  )
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omx-ralph [global-options] <command> [args]
+
+Global options:
+  --repo PATH
+  --state-dir PATH
+  --config PATH
+  --verbose
+
+Commands:
+  doctor
+  bootstrap
+  plan "task"
+  prepare "task"
+  current
+  exec
+  debug
+  verify
+  merge-gate
+  status
+  hint "text"
+  clear-hint
+
+Environment or config:
+  LOCAL_MODEL=ollama/qwen3-coder:30b
+  OLLAMA_BASE_URL=http://localhost:11434
+  CODEX_MODEL=gpt-5.4
+  MERGE_GATE_AGENT=codex
+  MERGE_GATE_MODEL=gpt-5.4
+  BASE_BRANCH=main
+  RALPH_BIN=ralph
+  OPENCODE_BIN=opencode
+  OMX_BIN=omx
+  ALLOW_DIRTY=0
+
+Notes:
+  - current repo is auto-detected unless --repo is provided
+  - default state dir is <repo>/.ralph
+  - bootstrap does not overwrite existing role files or opencode.json
+EOF
+}
+
+main() {
+  parse_global_args "$@"
+  load_config
+
+  [[ -n "${CMD:-}" ]] || {
+    usage
+    exit 1
+  }
+
+  resolve_repo
+
+  case "$CMD" in
+    doctor)
+      doctor
+      ;;
+    bootstrap)
+      bootstrap
+      ;;
+    plan)
+      [[ ${#CMD_ARGS[@]} -ge 1 ]] || die "task required"
+      plan_help "${CMD_ARGS[0]}"
+      ;;
+    prepare)
+      [[ ${#CMD_ARGS[@]} -ge 1 ]] || die "task required"
+      prepare_run "${CMD_ARGS[0]}"
+      ;;
+    current)
+      show_current
+      ;;
+    exec)
+      run_ralph opencode "$LOCAL_MODEL" executor "$MAX_ITERS_EXEC"
+      ;;
+    debug)
+      run_ralph opencode "$LOCAL_MODEL" debugger "$MAX_ITERS_DEBUG"
+      ;;
+    verify)
+      run_ralph opencode "$LOCAL_MODEL" verifier "$MAX_ITERS_VERIFY"
+      ;;
+    merge-gate)
+      run_ralph "$MERGE_GATE_AGENT" "$MERGE_GATE_MODEL" merge-gate "$MAX_ITERS_MERGE_GATE"
+      ;;
+    status)
+      status_loop
+      ;;
+    hint)
+      [[ ${#CMD_ARGS[@]} -ge 1 ]] || die "hint text required"
+      add_hint "${CMD_ARGS[0]}"
+      ;;
+    clear-hint)
+      clear_hint
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
