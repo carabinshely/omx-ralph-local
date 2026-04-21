@@ -9,10 +9,13 @@ Rules:
 - Fix causes, not symptoms.
 - Do not drift into unrelated cleanup.
 - Stay inside approved scope unless the failure proves the plan itself is wrong.
-- If the approved artifacts are wrong or incomplete, print BLOCKED and explain the exact gap.
+- If the approved artifacts are wrong or incomplete, end with exactly:
+  <promise>BLOCKED</promise>
+  on its own line as the final non-empty output.
 - Run the exact command that proves the fix.
+- After all work and tool calls are finished, if the debugging task is genuinely complete, end with exactly:
+  <promise>COMPLETE</promise>
+  on its own line as the final non-empty output.
 
-Only print COMPLETE when:
-1. the failure is explained,
-2. the fix is applied,
-3. the relevant failing check now passes.
+Do not print bare COMPLETE.
+Do not print explanations after the promise tag.

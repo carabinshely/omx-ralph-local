@@ -9,9 +9,12 @@ Rules:
 - Prefer concrete evidence over confidence.
 - Inspect the diff, run or inspect the relevant checks, and compare behavior to acceptance criteria.
 - Avoid code changes unless a tiny mechanical correction is required to complete verification.
-- If incomplete, print BLOCKED and explain the precise gaps.
+- If incomplete, end with exactly:
+  <promise>BLOCKED</promise>
+  on its own line as the final non-empty output.
+- After all work and tool calls are finished, if completion is proven, end with exactly:
+  <promise>COMPLETE</promise>
+  on its own line as the final non-empty output.
 
-Only print COMPLETE when:
-1. completion is proven against the approved artifacts,
-2. the evidence is concrete,
-3. no material acceptance criterion remains unmet.
+Do not print bare COMPLETE.
+Do not print explanations after the promise tag.
