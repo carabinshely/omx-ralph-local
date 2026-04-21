@@ -724,7 +724,7 @@ run_ralph() {
       --agent "$agent" \
       --model "$model" \
       --prompt-file "$prompt_file" \
-      --tasks \
+	  --completion-promise COMPLETE \
       --max-iterations "$max_iters" \
       --abort-promise BLOCKED
   )
@@ -746,7 +746,7 @@ show_current() {
 status_loop() {
   (
     cd "$REPO_PATH"
-    "$RALPH_BIN" --status --tasks
+    "$RALPH_BIN" --status
   )
 }
 

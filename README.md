@@ -216,6 +216,32 @@ run Ralph with OpenCode or Codex
 
 ---
 
+## Execution model
+
+This runner intentionally does **not** use Ralph tasks mode.
+
+The workflow is:
+
+- approved OMX artifacts are the planning source of truth
+- `prepare` snapshots those artifacts into the active run
+- `exec`, `debug`, `verify`, and `merge-gate` generate role-specific prompts from that saved run state
+- Ralph keeps looping until it sees a terminal promise tag
+- OpenCode `todowrite` may appear during execution, but it is only the agent's internal scratchpad and is **not** the orchestration source of truth
+
+### Promise contract
+
+For this runner, a loop step is considered complete only when the final non-empty line is exactly one of these promise tags:
+
+```text
+<promise>COMPLETE</promise>
+<promise>BLOCKED</promise>
+````
+
+Bare `COMPLETE` or `BLOCKED` is not enough.
+If anything appears after the promise tag, Ralph may continue looping.
+
+---
+
 ## Quick start
 
 Inside the target work repository:
@@ -252,6 +278,8 @@ omx-ralph verify
 omx-ralph merge-gate
 ```
 
+`exec`, `debug`, `verify`, and `merge-gate` do not use Ralph tasks mode; they rely on the saved run state plus terminal promise tags for loop control.
+
 ---
 
 ## Command reference
@@ -267,7 +295,7 @@ omx-ralph merge-gate
 | `debug`          | Same as `exec`, but with the `debugger` role                                                                                                                                                     |                          Indirectly |           Prompt only |                                 Yes |
 | `verify`         | Same as `exec`, but with the `verifier` role                                                                                                                                                     |                          Indirectly |           Prompt only |                                 Yes |
 | `merge-gate`     | Same as `exec`, but with the `merge-gate` role and usually Codex                                                                                                                                 |                          Indirectly |           Prompt only |                                 Yes |
-| `status`         | Delegates to `ralph --status --tasks` in the target repo                                                                                                                                         |                                  No |                    No |                                  No |
+| `status`         | Delegates to `ralph --status` in the target repo                                                                                                                                         |                                  No |                    No |                                  No |
 | `hint "text"`    | Adds extra Ralph context                                                                                                                                                                         |                                  No | Ralph-managed context |                                  No |
 | `clear-hint`     | Clears previously added Ralph context                                                                                                                                                            |                                  No | Ralph-managed context |                                  No |
 
@@ -395,8 +423,8 @@ That prompt includes:
   * plan artifacts are immutable for this run
   * stay inside approved scope
   * use concrete evidence
-  * if blocked, print `BLOCKED`
-  * if complete, print `COMPLETE`
+  * if blocked, end with `<promise>BLOCKED</promise>` as the final non-empty line
+  * if complete, end with `<promise>COMPLETE</promise>` as the final non-empty line
 
 ---
 
@@ -468,6 +496,15 @@ Use `--state-dir`:
 omx-ralph --repo ~/work/project --state-dir ~/.cache/omx-ralph/project-state prepare "Implement feature X"
 ```
 
+### Does this runner use `.ralph/ralph-tasks.md`?
+
+No.
+
+This workflow uses approved OMX artifacts as the planning source of truth and uses Ralph only as the execution loop.
+Loop control is based on terminal promise tags, not Ralph tasks mode.
+
+OpenCode may still use its own internal `todowrite` tool during execution, but that is not the source of orchestration truth for this runner.
+
 ---
 
 ## Notes and assumptions
@@ -479,6 +516,7 @@ omx-ralph --repo ~/work/project --state-dir ~/.cache/omx-ralph/project-state pre
 | `merge-gate` is intended to be strict and usually uses Ralph's `codex` agent | Separate final approval from local implementation               |
 | Branch names are derived from slugified task text                            | Similar task names can intentionally reuse the same branch      |
 | Approved artifacts are snapshotted per run                                   | The run keeps its own frozen copy even if `.omx/` changes later |
+| This runner does not use Ralph tasks mode                                        | Avoids conflicting task systems between OMX artifacts, Ralph tasks mode, and OpenCode `todowrite` |
 
 ---
 
@@ -530,6 +568,27 @@ omx-ralph prepare "Your task"
 ```
 
 first.
+
+### `Completion promise: not detected`
+
+Ralph only detects completion when the final non-empty line is exactly a promise tag such as:
+
+```text
+<promise>COMPLETE</promise>
+````
+
+For blocking, it should end with:
+
+```text
+<promise>BLOCKED</promise>
+```
+
+Important details:
+
+* bare `COMPLETE` or `BLOCKED` is not enough
+* printing the promise tag earlier in the output is not enough
+* if anything appears after the promise tag, completion may not be detected
+* this runner does not use Ralph tasks mode, so OpenCode `todowrite` output does not count as completion
 
 ---
 

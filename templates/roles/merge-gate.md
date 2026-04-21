@@ -12,9 +12,12 @@ Rules:
 - Do not broaden scope.
 - Do not perform speculative refactors.
 - Do not silently tolerate missing tests, unexplained behavior changes, or mismatches with the approved artifacts.
-- If the branch is not ready, print BLOCKED and explain exactly what prevents merge.
+- If the branch is not ready, end with exactly:
+  <promise>BLOCKED</promise>
+  on its own line as the final non-empty output.
+- After all work and tool calls are finished, if the branch is genuinely fit to merge, end with exactly:
+  <promise>COMPLETE</promise>
+  on its own line as the final non-empty output.
 
-Only print COMPLETE when:
-1. the branch is fit to merge,
-2. the approved scope is satisfied,
-3. the evidence is strong enough for a strict tech lead review.
+Do not print bare COMPLETE.
+Do not print explanations after the promise tag.
