@@ -130,7 +130,86 @@ mkdir -p ~/.local/bin
 ln -sf "$(pwd)/bin/omx-ralph" ~/.local/bin/omx-ralph
 ```
 
-Then make sure `~/.local/bin` is on your `PATH`.
+Then make sure `~/.local/bin` is on your `PATH` (environment variable), so `omx-ralph` can be run by name from any shell.
+
+### Check whether it is already on `PATH`
+
+Run:
+
+```bash
+echo "$PATH"
+````
+
+If you see `~/.local/bin` expanded as something like `/home/your-user/.local/bin`, you are done.
+
+You can also verify directly:
+
+```bash
+command -v omx-ralph
+```
+
+If it prints a path, the command is already discoverable.
+
+### Add `~/.local/bin` to `PATH` for Bash
+
+Append this to `~/.bashrc`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then reload your shell:
+
+```bash
+source ~/.bashrc
+```
+
+### Add `~/.local/bin` to `PATH` for Zsh
+
+Append this to `~/.zshrc`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then reload your shell:
+
+```bash
+source ~/.zshrc
+```
+
+### Add `~/.local/bin` to `PATH` for Fish
+
+Append this to your Fish config, usually `~/.config/fish/config.fish`:
+
+```fish
+set -gx PATH $HOME/.local/bin $PATH
+```
+
+Then reload your shell:
+
+```fish
+source ~/.config/fish/config.fish
+```
+
+### Verify after updating `PATH`
+
+Run:
+
+```bash
+command -v omx-ralph
+omx-ralph --help
+```
+
+If both work, the installation is wired correctly.
+
+### WSL note
+
+If you are using WSL, add `~/.local/bin` inside your **WSL shell config**, not in Windows PowerShell or Command Prompt.
+The `PATH` that matters for `omx-ralph` is the one seen by the shell where you run Ralph, OpenCode, and OMX.
+
+
+The symlink step places `omx-ralph` in `~/.local/bin`, but your shell will only find it automatically if that directory is included in `PATH`.
 
 ---
 
